@@ -1,0 +1,6 @@
+interface:
+  display_name: "桌签模板替换器"
+  short_description: "按原模板自动替换会议或就餐桌签姓名并保留原打印版式"
+  default_prompt: "使用 $desk-sign-template-replacer 按餐桌签或会议桌签原模板替换姓名并输出可直接裁剪的文件。"
+policy:
+  allow_implicit_invocation: true
