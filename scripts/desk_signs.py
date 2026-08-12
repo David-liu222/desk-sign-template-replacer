@@ -390,6 +390,47 @@ def write_zip(members: dict[str, bytes], output: Path) -> None:
             archive.writestr(name, data)
 
 
+def replace_one(mode: str, template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
+    """Dispatch one independent template branch without sharing layout logic."""
+    if mode == "dining":
+        replace_docx(template, names, output, explicit_soffice)
+    elif mode == "meeting":
+        replace_xlsx(template, names, output, explicit_soffice)
+    else:
+        raise ValueError(f"不支持的桌签类型：{mode}")
+
+
+def output_stem(value: str) -> str:
+    """Keep batch output inside the requested directory."""
+    stem = Path(value).name.strip()
+    stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem)
+    return stem or "桌签-替换版"
+
+
+def replace_batch(
+    mode: str,
+    dining_template: Path,
+    meeting_template: Path,
+    names: list[str],
+    output_dir: Path,
+    stem: str,
+    explicit_soffice: str | None,
+) -> list[Path]:
+    """Run dining/meeting branches separately, then return one grouped result."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = output_stem(stem)
+    outputs: list[Path] = []
+    if mode in {"dining", "all"}:
+        dining_output = output_dir / f"{safe_stem}-吃饭桌签.docx"
+        replace_one("dining", dining_template, names, dining_output, explicit_soffice)
+        outputs.append(dining_output)
+    if mode in {"meeting", "all"}:
+        meeting_output = output_dir / f"{safe_stem}-会议桌签.xlsx"
+        replace_one("meeting", meeting_template, names, meeting_output, explicit_soffice)
+        outputs.append(meeting_output)
+    return outputs
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -397,13 +438,22 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--source", required=True)
     extract.add_argument("--output", required=True)
     extract.add_argument("--soffice")
-    replace = sub.add_parser("replace", help="替换模板中的姓名")
+    replace = sub.add_parser("replace", help="替换一个桌签模板中的姓名")
     replace.add_argument("--mode", choices=["dining", "meeting"], required=True)
     replace.add_argument("--template", required=True)
     replace.add_argument("--names-file")
     replace.add_argument("--names")
     replace.add_argument("--output", required=True)
     replace.add_argument("--soffice")
+    batch = sub.add_parser("batch", help="分别制作吃饭/会议桌签，并统一返回输出文件")
+    batch.add_argument("--mode", choices=["dining", "meeting", "all"], required=True)
+    batch.add_argument("--dining-template", required=True)
+    batch.add_argument("--meeting-template", required=True)
+    batch.add_argument("--names-file")
+    batch.add_argument("--names")
+    batch.add_argument("--output-dir", required=True)
+    batch.add_argument("--output-stem", default="桌签-替换版")
+    batch.add_argument("--soffice")
     return parser
 
 
@@ -415,12 +465,23 @@ def main() -> int:
         print(f"提取 {len(names)} 个姓名")
         return 0
     names = read_names(args)
+    if args.command == "batch":
+        outputs = replace_batch(
+            args.mode,
+            Path(args.dining_template),
+            Path(args.meeting_template),
+            names,
+            Path(args.output_dir),
+            args.output_stem,
+            args.soffice,
+        )
+        print(f"已分别制作 {len(outputs)} 个桌签文件，共使用 {len(names)} 个姓名：")
+        for output in outputs:
+            print(output)
+        return 0
     template = Path(args.template)
     output = Path(args.output)
-    if args.mode == "dining":
-        replace_docx(template, names, output, args.soffice)
-    else:
-        replace_xlsx(template, names, output, args.soffice)
+    replace_one(args.mode, template, names, output, args.soffice)
     print(f"已替换 {len(names)} 个姓名：{output}")
     return 0
 
