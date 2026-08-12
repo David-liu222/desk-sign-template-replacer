@@ -279,6 +279,21 @@ def center_textbox(shape: etree._Element, box: etree._Element) -> None:
 
 def set_textbox_text(shape: etree._Element, box: etree._Element, value: str) -> None:
     center_textbox(shape, box)
+    for run in box.xpath(".//w:r", namespaces={"w": W_NS}):
+        rpr = run.find(f"{W}rPr")
+        if rpr is None:
+            rpr = etree.Element(f"{W}rPr")
+            run.insert(0, rpr)
+        fonts = rpr.find(f"{W}rFonts")
+        if fonts is None:
+            fonts = etree.SubElement(rpr, f"{W}rFonts")
+        for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+            fonts.set(f"{W}{attribute}", "楷体")
+        for tag in ("sz", "szCs"):
+            size = rpr.find(f"{W}{tag}")
+            if size is None:
+                size = etree.SubElement(rpr, f"{W}{tag}")
+            size.set(f"{W}val", "130")
     text_nodes = box.xpath(".//w:t", namespaces={"w": W_NS})
     if not text_nodes:
         paragraph = box.find(f".//{W}p")
@@ -362,6 +377,37 @@ def set_inline_string(cell: etree._Element, value: str) -> None:
     text.text = value
 
 
+def restore_meeting_template_font(members: dict[str, bytes], cells: list[etree._Element]) -> None:
+    """Undo LibreOffice's legacy-XLS font mapping for the template's name cells."""
+    styles_data = members.get("xl/styles.xml")
+    if styles_data is None:
+        return
+    styles = etree.fromstring(styles_data)
+    fonts = styles.find(f"{MAIN}fonts")
+    cell_xfs = styles.find(f"{MAIN}cellXfs")
+    if fonts is None or cell_xfs is None:
+        return
+    font_ids: set[int] = set()
+    for cell in cells:
+        style_id = cell.get("s")
+        if style_id is None or not style_id.isdigit() or int(style_id) >= len(cell_xfs):
+            continue
+        font_id = cell_xfs[int(style_id)].get("fontId")
+        if font_id is not None and font_id.isdigit() and int(font_id) < len(fonts):
+            font_ids.add(int(font_id))
+    for font_id in font_ids:
+        font = fonts[font_id]
+        name = font.find(f"{MAIN}name")
+        if name is None:
+            name = etree.SubElement(font, f"{MAIN}name")
+        name.set("val", "方正楷体_GBK")
+        size = font.find(f"{MAIN}sz")
+        if size is None:
+            size = etree.SubElement(font, f"{MAIN}sz")
+        size.set("val", "120")
+    members["xl/styles.xml"] = etree.tostring(styles, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
 def replace_xlsx(template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
     converted = convert_legacy(template, ".xlsx", explicit_soffice)
     with zipfile.ZipFile(converted) as archive:
@@ -379,6 +425,7 @@ def replace_xlsx(template: Path, names: list[str], output: Path, explicit_soffic
         raise ValueError(f"会议桌签模板最多 {len(cells)} 个姓名，本次有 {len(names)} 个")
     for index, cell in enumerate(cells):
         set_inline_string(cell, format_aligned_name(names[index]) if index < len(names) else "")
+    restore_meeting_template_font(members, cells)
     members[worksheet_name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
     write_zip(members, output)
 
