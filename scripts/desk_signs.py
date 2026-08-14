@@ -118,7 +118,9 @@ def name_issues(value: str) -> list[str]:
         issues.append("仅1个字符，需人工确认")
     if len(compact) > 12:
         issues.append("长度超过12个字符")
-    if len(compact) >= 3 and compact.endswith(("部门", "公司", "煤业", "矿业", "办公室", "中心")):
+    if len(compact) >= 3 and compact.endswith(
+        ("部", "科", "处", "室", "组", "队", "班", "部门", "公司", "煤业", "矿业", "办公室", "中心")
+    ):
         issues.append("疑似部门或单位名称")
     return list(dict.fromkeys(issues))
 
