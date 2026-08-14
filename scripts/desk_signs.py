@@ -535,6 +535,42 @@ def restore_meeting_template_font(members: dict[str, bytes], cells: list[etree._
     members["xl/styles.xml"] = etree.tostring(styles, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
+def set_meeting_print_layout(root: etree._Element, used_count: int) -> None:
+    """Keep only used rows and force exactly two name frames on every printed page."""
+    sheet_data = root.find(f"{MAIN}sheetData")
+    if sheet_data is None:
+        raise RuntimeError("会议桌签模板缺少工作表数据")
+    for row in list(sheet_data):
+        row_number = row.get("r", "")
+        if row_number.isdigit() and int(row_number) > used_count:
+            sheet_data.remove(row)
+    dimension = root.find(f"{MAIN}dimension")
+    if dimension is not None:
+        dimension.set("ref", f"A1:A{used_count}")
+    existing_breaks = root.find(f"{MAIN}rowBreaks")
+    if existing_breaks is not None:
+        root.remove(existing_breaks)
+    break_rows = list(range(2, used_count, 2))
+    if not break_rows:
+        return
+    row_breaks = etree.Element(f"{MAIN}rowBreaks")
+    row_breaks.set("count", str(len(break_rows)))
+    row_breaks.set("manualBreakCount", str(len(break_rows)))
+    for row_number in break_rows:
+        page_break = etree.SubElement(row_breaks, f"{MAIN}brk")
+        page_break.set("id", str(row_number))
+        page_break.set("min", "0")
+        page_break.set("max", "16383")
+        page_break.set("man", "1")
+    predecessor = root.find(f"{MAIN}headerFooter")
+    if predecessor is None:
+        predecessor = root.find(f"{MAIN}pageSetup")
+    if predecessor is None:
+        root.append(row_breaks)
+    else:
+        root.insert(root.index(predecessor) + 1, row_breaks)
+
+
 def replace_xlsx(template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
     converted = convert_legacy(template, ".xlsx", explicit_soffice)
     with zipfile.ZipFile(converted) as archive:
@@ -553,6 +589,7 @@ def replace_xlsx(template: Path, names: list[str], output: Path, explicit_soffic
     for index, cell in enumerate(cells):
         set_inline_string(cell, format_aligned_name(names[index]) if index < len(names) else "")
     restore_meeting_template_font(members, cells)
+    set_meeting_print_layout(root, len(names))
     members[worksheet_name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
     write_zip(members, output)
 
@@ -631,8 +668,19 @@ def verify_meeting_output(output: Path, names: list[str]) -> None:
     cells.sort(key=lambda cell: int(cell.get("r", "A0")[1:]))
     expected = [format_aligned_name(name) for name in names]
     actual = [meeting_cell_text(cell) for cell in cells]
-    if actual[: len(expected)] != expected or any(actual[len(expected) :]):
+    if actual != expected:
         raise RuntimeError("会议桌签验收失败：姓名、顺序或空白框与输入名单不一致")
+    expected_breaks = list(range(2, len(expected), 2))
+    actual_breaks = [
+        int(value)
+        for value in root.xpath("./main:rowBreaks/main:brk/@id", namespaces={"main": MAIN_NS})
+        if value.isdigit()
+    ]
+    if actual_breaks != expected_breaks:
+        raise RuntimeError("会议桌签验收失败：未按每张纸两个框设置分页")
+    page_setup = root.find(f"{MAIN}pageSetup")
+    if page_setup is None or page_setup.get("paperSize") != "9" or page_setup.get("orientation") != "portrait":
+        raise RuntimeError("会议桌签验收失败：打印纸张必须保持 A4 纵向")
     styles = etree.fromstring(members["xl/styles.xml"])
     fonts = styles.find(f"{MAIN}fonts")
     cell_xfs = styles.find(f"{MAIN}cellXfs")
