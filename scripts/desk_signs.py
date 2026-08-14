@@ -4,14 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections import Counter
 from pathlib import Path
-from typing import Iterable
 
 from lxml import etree
 
@@ -23,6 +24,26 @@ WPS = f"{{{WPS_NS}}}"
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 MAIN = f"{{{MAIN_NS}}}"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
+DINING_FONT = "楷体"
+DINING_FONT_HALF_POINTS = "130"
+MEETING_FONT = "方正楷体_GBK"
+MEETING_FONT_POINTS = "120"
+HEADER_CANDIDATES = {"姓名", "名字", "人员", "人员姓名", "姓名名单"}
+NON_NAME_TERMS = {
+    "序号",
+    "编号",
+    "部门",
+    "单位",
+    "岗位",
+    "职务",
+    "备注",
+    "电话",
+    "手机号",
+    "身份证号",
+    "合计",
+    "总计",
+    "人数",
+}
 
 
 def soffice_path(explicit: str | None = None) -> str:
@@ -77,6 +98,61 @@ def clean_name(value: str) -> str:
     if re.fullmatch(r"\d+", value):
         return ""
     return value.strip("，,；;、|\t ")
+
+
+def name_issues(value: str) -> list[str]:
+    """Return reasons why a value is unsafe to write as a person's name."""
+    compact = re.sub(r"\s+", "", value)
+    issues: list[str] = []
+    if not compact:
+        return ["空姓名"]
+    if compact in HEADER_CANDIDATES or compact in NON_NAME_TERMS:
+        issues.append("疑似表头或汇总字段")
+    if re.search(r"\d", compact):
+        issues.append("含数字")
+    if re.search(r"[:：,，;；|/\\]", value):
+        issues.append("含分隔符或字段标记")
+    if not re.fullmatch(r"[\u3400-\u9fffA-Za-z·•'’\-\s]+", value):
+        issues.append("含不支持的字符")
+    if len(compact) == 1:
+        issues.append("仅1个字符，需人工确认")
+    if len(compact) > 12:
+        issues.append("长度超过12个字符")
+    if len(compact) >= 3 and compact.endswith(("部门", "公司", "煤业", "矿业", "办公室", "中心")):
+        issues.append("疑似部门或单位名称")
+    return list(dict.fromkeys(issues))
+
+
+def validate_names(names: list[str]) -> None:
+    problems = [(index + 1, name, name_issues(name)) for index, name in enumerate(names)]
+    problems = [item for item in problems if item[2]]
+    if problems:
+        detail = "；".join(
+            f"第{index}项“{name}”（{'、'.join(issues)}）" for index, name, issues in problems[:12]
+        )
+        suffix = f"；另有 {len(problems) - 12} 项" if len(problems) > 12 else ""
+        raise ValueError(f"名单预检未通过：{detail}{suffix}。请修正名单后再生成，系统不会猜测姓名。")
+
+
+def write_name_audit(names: list[str], output: Path) -> None:
+    """Write a deterministic review sheet without modifying or deduplicating names."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    counts = Counter(names)
+    with output.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["序号", "原始姓名", "排版姓名", "字符数", "重复次数", "检查结果"])
+        for index, name in enumerate(names, start=1):
+            issues = name_issues(name)
+            writer.writerow(
+                [
+                    index,
+                    name,
+                    format_aligned_name(name),
+                    len(re.sub(r"\s+", "", name)),
+                    counts[name],
+                    "；".join(issues) if issues else "通过",
+                ]
+            )
 
 
 def format_aligned_name(value: str) -> str:
@@ -139,13 +215,12 @@ def table_rows_from_docx(root: etree._Element, ns: dict[str, str]) -> list[list[
 def names_from_table_rows(rows: list[list[str]]) -> list[str]:
     if not rows:
         return []
-    header_candidates = {"姓名", "名字", "人员", "人员姓名", "姓名名单"}
     header_index: int | None = None
     name_column: int | None = None
-    for row_index, row in enumerate(rows[:3]):
+    for row_index, row in enumerate(rows[:12]):
         for column_index, value in enumerate(row):
             normalized = re.sub(r"\s+", "", value)
-            if normalized in header_candidates:
+            if normalized in HEADER_CANDIDATES:
                 header_index = row_index
                 name_column = column_index
                 break
@@ -157,9 +232,42 @@ def names_from_table_rows(rows: list[list[str]]) -> list[str]:
             if name_column < len(row):
                 values.extend(split_text(row[name_column]))
     else:
-        for row in rows:
-            for value in row:
-                values.extend(split_text(value))
+        populated_rows = [
+            [(column_index, value) for column_index, value in enumerate(row) if value.strip()]
+            for row in rows
+        ]
+        populated_rows = [row for row in populated_rows if row]
+        if populated_rows and all(len(row) == 1 for row in populated_rows):
+            for row in populated_rows:
+                values.extend(split_text(row[0][1]))
+        else:
+            max_columns = max((len(row) for row in rows), default=0)
+            candidates: list[tuple[int, int, float]] = []
+            for column_index in range(max_columns):
+                column_values = [
+                    row[column_index]
+                    for row in rows
+                    if column_index < len(row) and row[column_index].strip()
+                ]
+                if not column_values:
+                    continue
+                plausible = 0
+                for raw_value in column_values:
+                    items = split_text(raw_value)
+                    if len(items) == 1 and not name_issues(items[0]):
+                        plausible += 1
+                ratio = plausible / len(column_values)
+                if plausible >= 2 and ratio >= 0.8:
+                    candidates.append((column_index, plausible, ratio))
+            if len(candidates) != 1:
+                raise ValueError(
+                    "表格没有明确的“姓名”表头，且无法唯一判断姓名列；"
+                    "请把姓名列表头改为“姓名”，系统不会把部门、职务等列当作姓名。"
+                )
+            selected_column = candidates[0][0]
+            for row in rows:
+                if selected_column < len(row):
+                    values.extend(split_text(row[selected_column]))
     return [name for name in values if name]
 
 
@@ -202,7 +310,7 @@ def names_from_xlsx(path: Path) -> list[str]:
     root = etree.fromstring(members[worksheet_name])
     rows: list[list[str]] = []
     for row in root.xpath(".//main:sheetData/main:row", namespaces={"main": MAIN_NS}):
-        values: list[str] = []
+        indexed_values: dict[int, str] = {}
         for cell in row.xpath("./main:c", namespaces={"main": MAIN_NS}):
             value = "".join(cell.xpath(".//main:t/text()", namespaces={"main": MAIN_NS}))
             if not value:
@@ -210,7 +318,16 @@ def names_from_xlsx(path: Path) -> list[str]:
                 value = numeric.text if numeric is not None and numeric.text else ""
             if cell.get("t") == "s" and value.isdigit() and int(value) < len(shared):
                 value = shared[int(value)]
-            values.append(value)
+            reference = cell.get("r", "")
+            match = re.match(r"([A-Z]+)", reference)
+            if match:
+                column_index = 0
+                for letter in match.group(1):
+                    column_index = column_index * 26 + ord(letter) - ord("A") + 1
+                indexed_values[column_index - 1] = value
+        values = [""] * (max(indexed_values, default=-1) + 1)
+        for column_index, value in indexed_values.items():
+            values[column_index] = value
         if any(values):
             rows.append(values)
     names = names_from_table_rows(rows)
@@ -236,7 +353,7 @@ def extract_names(source: Path, explicit_soffice: str | None = None) -> list[str
     raise ValueError(f"姓名来源必须是 Word、Excel 或 UTF-8 文本文件：{source}")
 
 
-def read_names(args: argparse.Namespace) -> list[str]:
+def read_names(args: argparse.Namespace, *, validate: bool = True) -> list[str]:
     if args.names_file:
         names = extract_names(Path(args.names_file), args.soffice)
     elif args.names is not None:
@@ -247,6 +364,8 @@ def read_names(args: argparse.Namespace) -> list[str]:
     names = [name for name in names if name]
     if not names:
         raise ValueError("未检测到有效姓名")
+    if validate:
+        validate_names(names)
     return names
 
 
@@ -288,12 +407,12 @@ def set_textbox_text(shape: etree._Element, box: etree._Element, value: str) -> 
         if fonts is None:
             fonts = etree.SubElement(rpr, f"{W}rFonts")
         for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
-            fonts.set(f"{W}{attribute}", "楷体")
+            fonts.set(f"{W}{attribute}", DINING_FONT)
         for tag in ("sz", "szCs"):
             size = rpr.find(f"{W}{tag}")
             if size is None:
                 size = etree.SubElement(rpr, f"{W}{tag}")
-            size.set(f"{W}val", "130")
+            size.set(f"{W}val", DINING_FONT_HALF_POINTS)
     text_nodes = box.xpath(".//w:t", namespaces={"w": W_NS})
     if not text_nodes:
         paragraph = box.find(f".//{W}p")
@@ -311,11 +430,8 @@ def set_textbox_text(shape: etree._Element, box: etree._Element, value: str) -> 
         node.attrib.pop(f"{{{XML_NS}}}space", None)
 
 
-def replace_docx(template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
-    converted = convert_legacy(template, ".docx", explicit_soffice)
-    with zipfile.ZipFile(converted) as archive:
-        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
-    root = etree.fromstring(members["word/document.xml"])
+def collect_dining_slots(root: etree._Element) -> list[tuple[int, int, int, list[etree._Element]]]:
+    """Pair each modern shape with its legacy fallback and return visual slot order."""
     ns = {"w": W_NS, "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"}
     slots: list[tuple[int, int, int, list[etree._Element]]] = []
     for paragraph_index, paragraph in enumerate(root.xpath("./w:body/w:p", namespaces=ns)):
@@ -334,7 +450,16 @@ def replace_docx(template: Path, names: list[str], output: Path, explicit_soffic
                 slots.append((paragraph_index, vertical, horizontal, [shape]))
             elif current_anchor is not None and slots and slots[-1][3][0] is current_anchor:
                 slots[-1][3].append(shape)
-    slots = visual_order(slots)
+    return visual_order(slots)
+
+
+def replace_docx(template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
+    converted = convert_legacy(template, ".docx", explicit_soffice)
+    with zipfile.ZipFile(converted) as archive:
+        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+    root = etree.fromstring(members["word/document.xml"])
+    ns = {"w": W_NS, "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"}
+    slots = collect_dining_slots(root)
     capacity = len(slots)
     person_capacity = capacity // 2
     if len(names) > person_capacity:
@@ -400,11 +525,11 @@ def restore_meeting_template_font(members: dict[str, bytes], cells: list[etree._
         name = font.find(f"{MAIN}name")
         if name is None:
             name = etree.SubElement(font, f"{MAIN}name")
-        name.set("val", "方正楷体_GBK")
+        name.set("val", MEETING_FONT)
         size = font.find(f"{MAIN}sz")
         if size is None:
             size = etree.SubElement(font, f"{MAIN}sz")
-        size.set("val", "120")
+        size.set("val", MEETING_FONT_POINTS)
     members["xl/styles.xml"] = etree.tostring(styles, xml_declaration=True, encoding="UTF-8", standalone=True)
 
 
@@ -437,14 +562,132 @@ def write_zip(members: dict[str, bytes], output: Path) -> None:
             archive.writestr(name, data)
 
 
-def replace_one(mode: str, template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
-    """Dispatch one independent template branch without sharing layout logic."""
+def verify_dining_output(output: Path, names: list[str]) -> None:
+    """Verify every retained visible/fallback box, font, spacing, and name order."""
+    with zipfile.ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": W_NS, "wps": WPS_NS}
+    slots = collect_dining_slots(root)
+    expected = [format_aligned_name(name) for name in names for _ in range(2)]
+    if len(slots) < len(expected):
+        raise RuntimeError(f"餐桌签验收失败：应有 {len(expected)} 个姓名框，实际仅 {len(slots)} 个")
+    for slot_index, (_, _, _, shapes) in enumerate(slots):
+        expected_text = expected[slot_index] if slot_index < len(expected) else "\u00a0"
+        boxes = [box for shape in shapes for box in shape.xpath(".//w:txbxContent", namespaces=ns)]
+        if not boxes:
+            raise RuntimeError(f"餐桌签验收失败：第 {slot_index + 1} 个框没有文本框内容")
+        for box in boxes:
+            actual_text = "".join(box.xpath(".//w:t/text()", namespaces=ns))
+            if actual_text != expected_text:
+                raise RuntimeError(
+                    f"餐桌签验收失败：第 {slot_index + 1} 个框应为“{expected_text}”，"
+                    f"实际为“{actual_text}”"
+                )
+            for paragraph in box.xpath("./w:p", namespaces=ns):
+                if paragraph.xpath("string(w:pPr/w:jc/@w:val)", namespaces=ns) != "center":
+                    raise RuntimeError(f"餐桌签验收失败：第 {slot_index + 1} 个框未水平居中")
+                before = paragraph.xpath("string(w:pPr/w:spacing/@w:before)", namespaces=ns)
+                after = paragraph.xpath("string(w:pPr/w:spacing/@w:after)", namespaces=ns)
+                if before != "600" or after != "0":
+                    raise RuntimeError(f"餐桌签验收失败：第 {slot_index + 1} 个框垂直位置不符合模板规则")
+            for run in box.xpath(".//w:r", namespaces=ns):
+                for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+                    font = run.xpath(f"string(w:rPr/w:rFonts/@w:{attribute})", namespaces=ns)
+                    if font != DINING_FONT:
+                        raise RuntimeError(
+                            f"餐桌签验收失败：第 {slot_index + 1} 个框字体应为 {DINING_FONT}，实际为 {font or '空'}"
+                        )
+                for tag in ("sz", "szCs"):
+                    size = run.xpath(f"string(w:rPr/w:{tag}/@w:val)", namespaces=ns)
+                    if size != DINING_FONT_HALF_POINTS:
+                        raise RuntimeError(
+                            f"餐桌签验收失败：第 {slot_index + 1} 个框字号应为 65，XML 实际值为 {size or '空'}"
+                        )
+        for shape in shapes:
+            for body_pr in shape.xpath(".//wps:bodyPr", namespaces=ns):
+                if body_pr.get("anchor") != "ctr":
+                    raise RuntimeError(f"餐桌签验收失败：第 {slot_index + 1} 个框未垂直居中")
+
+
+def meeting_cell_text(cell: etree._Element) -> str:
+    return "".join(cell.xpath(".//main:t/text()", namespaces={"main": MAIN_NS}))
+
+
+def verify_meeting_output(output: Path, names: list[str]) -> None:
+    """Verify exact meeting-name order plus the template font/alignment style."""
+    with zipfile.ZipFile(output) as archive:
+        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+    worksheet_name = next((name for name in members if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)), None)
+    if worksheet_name is None or "xl/styles.xml" not in members:
+        raise RuntimeError("会议桌签验收失败：工作表或样式表缺失")
+    root = etree.fromstring(members[worksheet_name])
+    cells = [
+        cell
+        for cell in root.xpath(".//main:sheetData/main:row/main:c", namespaces={"main": MAIN_NS})
+        if re.fullmatch(r"A\d+", cell.get("r", ""))
+    ]
+    cells.sort(key=lambda cell: int(cell.get("r", "A0")[1:]))
+    expected = [format_aligned_name(name) for name in names]
+    actual = [meeting_cell_text(cell) for cell in cells]
+    if actual[: len(expected)] != expected or any(actual[len(expected) :]):
+        raise RuntimeError("会议桌签验收失败：姓名、顺序或空白框与输入名单不一致")
+    styles = etree.fromstring(members["xl/styles.xml"])
+    fonts = styles.find(f"{MAIN}fonts")
+    cell_xfs = styles.find(f"{MAIN}cellXfs")
+    if fonts is None or cell_xfs is None:
+        raise RuntimeError("会议桌签验收失败：字体或单元格样式缺失")
+    for index, cell in enumerate(cells[: len(expected)], start=1):
+        style_id = cell.get("s", "")
+        if not style_id.isdigit() or int(style_id) >= len(cell_xfs):
+            raise RuntimeError(f"会议桌签验收失败：第 {index} 个姓名框样式无效")
+        style = cell_xfs[int(style_id)]
+        font_id = style.get("fontId", "")
+        if not font_id.isdigit() or int(font_id) >= len(fonts):
+            raise RuntimeError(f"会议桌签验收失败：第 {index} 个姓名框字体引用无效")
+        font = fonts[int(font_id)]
+        font_name = font.xpath("string(main:name/@val)", namespaces={"main": MAIN_NS})
+        font_size = font.xpath("string(main:sz/@val)", namespaces={"main": MAIN_NS})
+        if font_name != MEETING_FONT or font_size != MEETING_FONT_POINTS:
+            raise RuntimeError(
+                f"会议桌签验收失败：第 {index} 个姓名框应为 {MEETING_FONT} {MEETING_FONT_POINTS} 磅"
+            )
+        alignment = style.find(f"{MAIN}alignment")
+        if alignment is None or alignment.get("horizontal") != "center" or alignment.get("vertical") != "center":
+            raise RuntimeError(f"会议桌签验收失败：第 {index} 个姓名框未在框内居中")
+
+
+def verify_output(mode: str, output: Path, names: list[str]) -> None:
+    if mode == "dining":
+        verify_dining_output(output, names)
+    elif mode == "meeting":
+        verify_meeting_output(output, names)
+    else:
+        raise ValueError(f"不支持的桌签类型：{mode}")
+
+
+def build_raw(
+    mode: str,
+    template: Path,
+    names: list[str],
+    output: Path,
+    explicit_soffice: str | None,
+) -> None:
     if mode == "dining":
         replace_docx(template, names, output, explicit_soffice)
     elif mode == "meeting":
         replace_xlsx(template, names, output, explicit_soffice)
     else:
         raise ValueError(f"不支持的桌签类型：{mode}")
+    verify_output(mode, output, names)
+
+
+def replace_one(mode: str, template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
+    """Build and verify one branch before atomically replacing the final file."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".desk-sign-stage-", dir=output.parent) as stage_dir:
+        staged = Path(stage_dir) / output.name
+        build_raw(mode, template, names, staged, explicit_soffice)
+        os.replace(staged, output)
 
 
 def output_stem(value: str) -> str:
@@ -452,6 +695,70 @@ def output_stem(value: str) -> str:
     stem = Path(value).name.strip()
     stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem)
     return stem or "桌签-替换版"
+
+
+def template_capacity(mode: str, template: Path, explicit_soffice: str | None) -> int:
+    if mode == "dining":
+        converted = convert_legacy(template, ".docx", explicit_soffice)
+        with zipfile.ZipFile(converted) as archive:
+            root = etree.fromstring(archive.read("word/document.xml"))
+        capacity = len(collect_dining_slots(root)) // 2
+    elif mode == "meeting":
+        converted = convert_legacy(template, ".xlsx", explicit_soffice)
+        with zipfile.ZipFile(converted) as archive:
+            worksheet_name = next(
+                (info.filename for info in archive.infolist() if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", info.filename)),
+                None,
+            )
+            if worksheet_name is None:
+                raise RuntimeError("会议桌签模板没有可编辑工作表")
+            root = etree.fromstring(archive.read(worksheet_name))
+        capacity = sum(
+            1
+            for cell in root.xpath(".//main:sheetData/main:row/main:c", namespaces={"main": MAIN_NS})
+            if re.fullmatch(r"A\d+", cell.get("r", ""))
+        )
+    else:
+        raise ValueError(f"不支持的桌签类型：{mode}")
+    if capacity <= 0:
+        raise RuntimeError("模板中没有检测到可替换的桌签框")
+    return capacity
+
+
+def split_name_batches(names: list[str], capacity: int, split_overflow: bool) -> list[list[str]]:
+    if len(names) <= capacity:
+        return [names]
+    if not split_overflow:
+        raise ValueError(
+            f"模板每个文件最多 {capacity} 人，本次有 {len(names)} 人；"
+            "请使用 --split-overflow 自动按原顺序分批。"
+        )
+    return [names[index : index + capacity] for index in range(0, len(names), capacity)]
+
+
+def numbered_output(base: Path, index: int, total: int) -> Path:
+    if total == 1:
+        return base
+    return base.with_name(f"{base.stem}-第{index:02d}批{base.suffix}")
+
+
+def publish_plans(
+    plans: list[tuple[str, Path, list[str], Path]],
+    output_dir: Path,
+    explicit_soffice: str | None,
+) -> list[Path]:
+    """Build every planned file first; publish none unless every verification passes."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".desk-sign-stage-", dir=output_dir) as stage_dir:
+        stage_root = Path(stage_dir)
+        staged_outputs: list[tuple[Path, Path]] = []
+        for plan_index, (mode, template, batch_names, final_output) in enumerate(plans, start=1):
+            staged = stage_root / f"{plan_index:03d}-{final_output.name}"
+            build_raw(mode, template, batch_names, staged, explicit_soffice)
+            staged_outputs.append((staged, final_output))
+        for staged, final_output in staged_outputs:
+            os.replace(staged, final_output)
+    return [plan[3] for plan in plans]
 
 
 def replace_batch(
@@ -462,20 +769,24 @@ def replace_batch(
     output_dir: Path,
     stem: str,
     explicit_soffice: str | None,
+    split_overflow: bool = False,
 ) -> list[Path]:
-    """Run dining/meeting branches separately, then return one grouped result."""
-    output_dir.mkdir(parents=True, exist_ok=True)
+    """Plan branches separately, verify all staged files, then publish the group."""
     safe_stem = output_stem(stem)
-    outputs: list[Path] = []
+    plans: list[tuple[str, Path, list[str], Path]] = []
     if mode in {"dining", "all"}:
-        dining_output = output_dir / f"{safe_stem}-吃饭桌签.docx"
-        replace_one("dining", dining_template, names, dining_output, explicit_soffice)
-        outputs.append(dining_output)
+        capacity = template_capacity("dining", dining_template, explicit_soffice)
+        name_batches = split_name_batches(names, capacity, split_overflow)
+        base = output_dir / f"{safe_stem}-吃饭桌签.docx"
+        for index, batch_names in enumerate(name_batches, start=1):
+            plans.append(("dining", dining_template, batch_names, numbered_output(base, index, len(name_batches))))
     if mode in {"meeting", "all"}:
-        meeting_output = output_dir / f"{safe_stem}-会议桌签.xlsx"
-        replace_one("meeting", meeting_template, names, meeting_output, explicit_soffice)
-        outputs.append(meeting_output)
-    return outputs
+        capacity = template_capacity("meeting", meeting_template, explicit_soffice)
+        name_batches = split_name_batches(names, capacity, split_overflow)
+        base = output_dir / f"{safe_stem}-会议桌签.xlsx"
+        for index, batch_names in enumerate(name_batches, start=1):
+            plans.append(("meeting", meeting_template, batch_names, numbered_output(base, index, len(name_batches))))
+    return publish_plans(plans, output_dir, explicit_soffice)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -491,6 +802,7 @@ def build_parser() -> argparse.ArgumentParser:
     replace.add_argument("--names-file")
     replace.add_argument("--names")
     replace.add_argument("--output", required=True)
+    replace.add_argument("--split-overflow", action="store_true")
     replace.add_argument("--soffice")
     batch = sub.add_parser("batch", help="分别制作吃饭/会议桌签，并统一返回输出文件")
     batch.add_argument("--mode", choices=["dining", "meeting", "all"], required=True)
@@ -500,7 +812,13 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--names")
     batch.add_argument("--output-dir", required=True)
     batch.add_argument("--output-stem", default="桌签-替换版")
+    batch.add_argument("--split-overflow", action="store_true")
     batch.add_argument("--soffice")
+    audit = sub.add_parser("audit", help="生成名单核对 CSV，不制作桌签")
+    audit.add_argument("--names-file")
+    audit.add_argument("--names")
+    audit.add_argument("--output", required=True)
+    audit.add_argument("--soffice")
     return parser
 
 
@@ -510,6 +828,17 @@ def main() -> int:
         names = extract_names(Path(args.source), args.soffice)
         Path(args.output).write_text("\n".join(names) + "\n", encoding="utf-8")
         print(f"提取 {len(names)} 个姓名")
+        return 0
+    if args.command == "audit":
+        names = read_names(args, validate=False)
+        output = Path(args.output)
+        write_name_audit(names, output)
+        issue_count = sum(bool(name_issues(name)) for name in names)
+        duplicate_count = sum(count - 1 for count in Counter(names).values() if count > 1)
+        print(
+            f"已核对 {len(names)} 项：异常 {issue_count} 项，重复出现 {duplicate_count} 次；"
+            f"核对表：{output}"
+        )
         return 0
     names = read_names(args)
     if args.command == "batch":
@@ -521,6 +850,7 @@ def main() -> int:
             Path(args.output_dir),
             args.output_stem,
             args.soffice,
+            args.split_overflow,
         )
         print(f"已分别制作 {len(outputs)} 个桌签文件，共使用 {len(names)} 个姓名：")
         for output in outputs:
@@ -528,8 +858,16 @@ def main() -> int:
         return 0
     template = Path(args.template)
     output = Path(args.output)
-    replace_one(args.mode, template, names, output, args.soffice)
-    print(f"已替换 {len(names)} 个姓名：{output}")
+    capacity = template_capacity(args.mode, template, args.soffice)
+    name_batches = split_name_batches(names, capacity, args.split_overflow)
+    plans = [
+        (args.mode, template, batch_names, numbered_output(output, index, len(name_batches)))
+        for index, batch_names in enumerate(name_batches, start=1)
+    ]
+    outputs = publish_plans(plans, output.parent, args.soffice)
+    print(f"已替换并验收 {len(names)} 个姓名，生成 {len(outputs)} 个文件：")
+    for result in outputs:
+        print(result)
     return 0
 
 
