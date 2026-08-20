@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import zipfile
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 from lxml import etree
@@ -28,6 +29,108 @@ DINING_FONT = "楷体"
 DINING_FONT_HALF_POINTS = "130"
 MEETING_FONT = "方正楷体_GBK"
 MEETING_FONT_POINTS = "120"
+PINYIN_FONT = "楷体"
+PINYIN_FONT_HALF_POINTS = "130"
+PINYIN_PEOPLE_PER_PAGE = 2
+PINYIN_SLOTS_PER_PERSON = 2
+PINYIN_INNER_WIDTH_POINTS = 230.0
+COMPOUND_SURNAMES = {
+    "欧阳",
+    "太史",
+    "端木",
+    "上官",
+    "司马",
+    "东方",
+    "独孤",
+    "南宫",
+    "万俟",
+    "闻人",
+    "夏侯",
+    "诸葛",
+    "尉迟",
+    "公羊",
+    "赫连",
+    "澹台",
+    "皇甫",
+    "宗政",
+    "濮阳",
+    "公冶",
+    "太叔",
+    "申屠",
+    "公孙",
+    "慕容",
+    "仲孙",
+    "钟离",
+    "长孙",
+    "宇文",
+    "司徒",
+    "鲜于",
+    "司空",
+    "闾丘",
+    "子车",
+    "亓官",
+    "司寇",
+    "巫马",
+    "公西",
+    "颛孙",
+    "壤驷",
+    "公良",
+    "漆雕",
+    "乐正",
+    "宰父",
+    "谷梁",
+    "拓跋",
+    "夹谷",
+    "轩辕",
+    "令狐",
+    "段干",
+    "百里",
+    "呼延",
+    "东郭",
+    "南门",
+    "羊舌",
+    "微生",
+    "公户",
+    "公玉",
+    "公仪",
+    "梁丘",
+    "公仲",
+    "公上",
+    "公门",
+    "公山",
+    "公坚",
+    "左丘",
+    "公伯",
+    "西门",
+    "公祖",
+    "第五",
+    "公乘",
+    "贯丘",
+    "公皙",
+    "南荣",
+    "东里",
+    "东宫",
+    "仲长",
+    "子书",
+    "子桑",
+    "即墨",
+    "达奚",
+    "褚师",
+}
+SURNAME_PINYIN_OVERRIDES = {
+    "单": "Shan",
+    "曾": "Zeng",
+    "解": "Xie",
+    "仇": "Qiu",
+    "区": "Ou",
+    "查": "Zha",
+    "朴": "Piao",
+    "乐": "Yue",
+    "重": "Chong",
+    "翟": "Zhai",
+    "折": "She",
+    "黑": "He",
+}
 HEADER_CANDIDATES = {"姓名", "名字", "人员", "人员姓名", "姓名名单"}
 NON_NAME_TERMS = {
     "序号",
@@ -116,8 +219,10 @@ def name_issues(value: str) -> list[str]:
         issues.append("含不支持的字符")
     if len(compact) == 1:
         issues.append("仅1个字符，需人工确认")
-    if len(compact) > 12:
-        issues.append("长度超过12个字符")
+    if re.search(r"[\u3400-\u9fff]", compact) and len(compact) > 12:
+        issues.append("中文姓名长度超过12个字符")
+    if not re.search(r"[\u3400-\u9fff]", compact) and len(compact) > 30:
+        issues.append("拼音或拉丁字母姓名长度超过30个字符")
     if len(compact) >= 3 and compact.endswith(
         ("部", "科", "处", "室", "组", "队", "班", "部门", "公司", "煤业", "矿业", "办公室", "中心")
     ):
@@ -455,6 +560,239 @@ def collect_dining_slots(root: etree._Element) -> list[tuple[int, int, int, list
     return visual_order(slots)
 
 
+def set_textbox_text_preserving_style(box: etree._Element, value: str) -> None:
+    """Replace only text nodes, leaving the template's paragraph/run geometry intact."""
+    text_nodes = box.xpath(".//w:t", namespaces={"w": W_NS})
+    if not text_nodes:
+        paragraph = box.find(f".//{W}p")
+        if paragraph is None:
+            raise RuntimeError("拼音桌签模板中的文本框没有可写段落")
+        run = etree.SubElement(paragraph, f"{W}r")
+        text_nodes = [etree.SubElement(run, f"{W}t")]
+    text_nodes[0].text = value
+    if value.startswith(" ") or value.endswith(" "):
+        text_nodes[0].set(f"{{{XML_NS}}}space", "preserve")
+    else:
+        text_nodes[0].attrib.pop(f"{{{XML_NS}}}space", None)
+    for node in text_nodes[1:]:
+        node.text = ""
+        node.attrib.pop(f"{{{XML_NS}}}space", None)
+
+
+def renumber_cloned_shapes(root: etree._Element) -> None:
+    """Give cloned modern/VML shapes unique IDs so Word can open repeated pages safely."""
+    ns = {
+        "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        "v": "urn:schemas-microsoft-com:vml",
+    }
+    for index, element in enumerate(root.xpath(".//wp:docPr", namespaces=ns), start=1):
+        element.set("id", str(index))
+    for index, element in enumerate(root.xpath(".//*[local-name()='cNvPr']"), start=1):
+        element.set("id", str(index))
+    for index, element in enumerate(root.xpath(".//v:shape", namespaces=ns), start=1):
+        element.set("id", f"pinyin_shape_{index:04d}")
+
+
+def trim_pinyin_template(
+    source: Path,
+    output: Path,
+    explicit_soffice: str | None,
+) -> None:
+    """Keep only source page 1 and sanitize its four name boxes."""
+    converted = convert_legacy(source, ".docx", explicit_soffice)
+    with zipfile.ZipFile(converted) as archive:
+        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+    root = etree.fromstring(members["word/document.xml"])
+    ns = {"w": W_NS}
+    slots = collect_dining_slots(root)
+    if len(slots) < PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON:
+        raise RuntimeError("拼音桌签第一页少于4个姓名框，无法建立模板")
+    first_page_slots = slots[: PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON]
+    last_paragraph_index = first_page_slots[-1][0]
+    body = root.find(f"{W}body")
+    if body is None:
+        raise RuntimeError("拼音桌签模板缺少 Word 正文")
+    paragraphs = body.findall(f"{W}p")
+    for paragraph in paragraphs[last_paragraph_index + 1 :]:
+        body.remove(paragraph)
+    for page_break in body.xpath('.//w:br[@w:type="page"]', namespaces=ns):
+        parent = page_break.getparent()
+        if parent is not None:
+            parent.remove(page_break)
+    placeholders = ["Pinyin", "Pinyin", "Sample", "Sample"]
+    retained_slots = collect_dining_slots(root)
+    for slot, placeholder in zip(retained_slots, placeholders, strict=True):
+        for shape in slot[3]:
+            for box in shape.xpath(".//w:txbxContent", namespaces=ns):
+                set_textbox_text_preserving_style(box, placeholder)
+    renumber_cloned_shapes(root)
+    members["word/document.xml"] = etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    write_zip(members, output)
+
+
+def normalize_latin_name(value: str) -> str:
+    words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", value)
+    if not words:
+        raise ValueError(f"无法识别拼音姓名：{value}")
+    # A non-breaking space keeps a full pinyin name on one line inside the
+    # original 65-point first-page frame. It prints like an ordinary space.
+    return "\u00a0".join(word[:1].upper() + word[1:].lower() for word in words)
+
+
+def romanize_names(names: list[str]) -> list[str]:
+    """Convert Chinese names to surname-first, toneless title-case pinyin."""
+    chinese_indexes = [index for index, name in enumerate(names) if re.search(r"[\u3400-\u9fff]", name)]
+    raw_pinyin: dict[int, list[str]] = {}
+    if chinese_indexes:
+        swift_script = Path(__file__).with_name("han_to_pinyin.swift")
+        if not swift_script.exists():
+            raise RuntimeError("缺少中文转拼音脚本 han_to_pinyin.swift")
+        payload = "\n".join(names[index] for index in chinese_indexes) + "\n"
+        result = subprocess.run(
+            ["/usr/bin/swift", str(swift_script)],
+            input=payload,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "中文转拼音失败")
+        lines = result.stdout.splitlines()
+        if len(lines) != len(chinese_indexes):
+            raise RuntimeError("中文转拼音返回数量与姓名数量不一致")
+        for index, line in zip(chinese_indexes, lines, strict=True):
+            tokens = re.findall(r"[A-Za-z]+", line)
+            if not tokens:
+                raise ValueError(f"无法转换姓名“{names[index]}”，请直接输入目标拼音")
+            raw_pinyin[index] = tokens
+
+    output: list[str] = []
+    for index, name in enumerate(names):
+        if index not in raw_pinyin:
+            output.append(normalize_latin_name(name))
+            continue
+        compact = re.sub(r"\s+", "", name)
+        tokens = raw_pinyin[index]
+        surname_length = 2 if compact[:2] in COMPOUND_SURNAMES else 1
+        if len(tokens) <= surname_length:
+            output.append(normalize_latin_name(" ".join(tokens)))
+            continue
+        if surname_length == 1 and compact[:1] in SURNAME_PINYIN_OVERRIDES:
+            surname = SURNAME_PINYIN_OVERRIDES[compact[:1]]
+        else:
+            surname = "".join(token.lower() for token in tokens[:surname_length]).capitalize()
+        given_name = "".join(token.lower() for token in tokens[surname_length:]).capitalize()
+        output.append(f"{surname}\u00a0{given_name}")
+    return output
+
+
+def pinyin_em_width(value: str) -> float:
+    """Approximate bold serif Latin width in em units for deterministic fitting."""
+    narrow = set("Iijlrtf1'’")
+    wide = set("MWmwQG@")
+    total = 0.0
+    for character in value:
+        if character in {" ", "\u00a0"}:
+            total += 0.28
+        elif character in narrow:
+            total += 0.30
+        elif character in wide:
+            total += 0.82
+        elif character.isupper():
+            total += 0.64
+        else:
+            total += 0.52
+    return max(total, 1.0)
+
+
+def pinyin_font_half_points(values: list[str]) -> str:
+    """Use one size for the whole output, capped at the page-1 template's 65 pt."""
+    widest = max(pinyin_em_width(value) for value in values)
+    fitted_points = int((PINYIN_INNER_WIDTH_POINTS * 0.94) // widest)
+    if fitted_points < 30:
+        longest = max(values, key=pinyin_em_width)
+        raise ValueError(f"拼音姓名“{longest.replace(chr(160), ' ')}”过长，30磅仍可能超出框，请缩短或确认写法")
+    return str(min(65, fitted_points) * 2)
+
+
+def set_pinyin_font_size(box: etree._Element, half_points: str) -> None:
+    for run in box.xpath(".//w:r", namespaces={"w": W_NS}):
+        rpr = run.find(f"{W}rPr")
+        if rpr is None:
+            rpr = etree.Element(f"{W}rPr")
+            run.insert(0, rpr)
+        for tag in ("sz", "szCs"):
+            size = rpr.find(f"{W}{tag}")
+            if size is None:
+                size = etree.SubElement(rpr, f"{W}{tag}")
+            size.set(f"{W}val", half_points)
+
+
+def page_break_paragraph() -> etree._Element:
+    paragraph = etree.Element(f"{W}p")
+    run = etree.SubElement(paragraph, f"{W}r")
+    page_break = etree.SubElement(run, f"{W}br")
+    page_break.set(f"{W}type", "page")
+    return paragraph
+
+
+def replace_pinyin_docx(
+    template: Path,
+    names: list[str],
+    output: Path,
+    explicit_soffice: str | None,
+) -> None:
+    converted = convert_legacy(template, ".docx", explicit_soffice)
+    with zipfile.ZipFile(converted) as archive:
+        members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+    root = etree.fromstring(members["word/document.xml"])
+    body = root.find(f"{W}body")
+    if body is None:
+        raise RuntimeError("拼音桌签模板缺少 Word 正文")
+    template_slots = collect_dining_slots(root)
+    expected_template_slots = PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON
+    if len(template_slots) != expected_template_slots:
+        raise RuntimeError(
+            f"拼音桌签模板必须只保留第一页的 {expected_template_slots} 个框，实际为 {len(template_slots)} 个"
+        )
+    section = body.find(f"{W}sectPr")
+    template_children = [deepcopy(child) for child in body if child is not section]
+    if not template_children:
+        raise RuntimeError("拼音桌签模板第一页没有可复制内容")
+    for child in list(body):
+        body.remove(child)
+    page_count = (len(names) + PINYIN_PEOPLE_PER_PAGE - 1) // PINYIN_PEOPLE_PER_PAGE
+    for page_index in range(page_count):
+        if page_index:
+            body.append(page_break_paragraph())
+        for child in template_children:
+            body.append(deepcopy(child))
+    if section is not None:
+        body.append(section)
+    renumber_cloned_shapes(root)
+    pinyin_names = romanize_names(names)
+    font_half_points = pinyin_font_half_points(pinyin_names)
+    slots = collect_dining_slots(root)
+    expected_slot_count = page_count * expected_template_slots
+    if len(slots) != expected_slot_count:
+        raise RuntimeError(
+            f"拼音桌签扩页失败：应有 {expected_slot_count} 个框，实际为 {len(slots)} 个"
+        )
+    ns = {"w": W_NS}
+    for slot_index, slot in enumerate(slots):
+        person_index = slot_index // PINYIN_SLOTS_PER_PERSON
+        value = pinyin_names[person_index] if person_index < len(pinyin_names) else "\u00a0"
+        for shape in slot[3]:
+            for box in shape.xpath(".//w:txbxContent", namespaces=ns):
+                set_textbox_text_preserving_style(box, value)
+                set_pinyin_font_size(box, font_half_points)
+    members["word/document.xml"] = etree.tostring(
+        root, xml_declaration=True, encoding="UTF-8", standalone=True
+    )
+    write_zip(members, output)
+
+
 def replace_docx(template: Path, names: list[str], output: Path, explicit_soffice: str | None) -> None:
     converted = convert_legacy(template, ".docx", explicit_soffice)
     with zipfile.ZipFile(converted) as archive:
@@ -706,11 +1044,66 @@ def verify_meeting_output(output: Path, names: list[str]) -> None:
             raise RuntimeError(f"会议桌签验收失败：第 {index} 个姓名框未在框内居中")
 
 
+def verify_pinyin_output(output: Path, names: list[str]) -> None:
+    """Verify repeated pairs, first-page typography, and two people per A4 page."""
+    with zipfile.ZipFile(output) as archive:
+        root = etree.fromstring(archive.read("word/document.xml"))
+    ns = {"w": W_NS}
+    slots = collect_dining_slots(root)
+    page_count = (len(names) + PINYIN_PEOPLE_PER_PAGE - 1) // PINYIN_PEOPLE_PER_PAGE
+    expected_slots = page_count * PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON
+    if len(slots) != expected_slots:
+        raise RuntimeError(f"拼音桌签验收失败：应有 {expected_slots} 个框，实际为 {len(slots)} 个")
+    pinyin_names = romanize_names(names)
+    expected_font_size = pinyin_font_half_points(pinyin_names)
+    expected = [value for value in pinyin_names for _ in range(PINYIN_SLOTS_PER_PERSON)]
+    expected.extend(["\u00a0"] * (expected_slots - len(expected)))
+    for slot_index, (_, _, _, shapes) in enumerate(slots):
+        for shape in shapes:
+            boxes = shape.xpath(".//w:txbxContent", namespaces=ns)
+            if not boxes:
+                raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框没有文本内容")
+            for box in boxes:
+                actual = "".join(box.xpath(".//w:t/text()", namespaces=ns))
+                if actual != expected[slot_index]:
+                    raise RuntimeError(
+                        f"拼音桌签验收失败：第 {slot_index + 1} 个框应为“{expected[slot_index]}”，实际为“{actual}”"
+                    )
+                runs = box.xpath(".//w:r[w:t]", namespaces=ns)
+                if not runs:
+                    raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框缺少文字运行")
+                first_run = runs[0]
+                for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+                    font = first_run.xpath(f"string(w:rPr/w:rFonts/@w:{attribute})", namespaces=ns)
+                    if font != PINYIN_FONT:
+                        raise RuntimeError(
+                            f"拼音桌签验收失败：第 {slot_index + 1} 个框字体应为 {PINYIN_FONT}，实际为 {font or '空'}"
+                        )
+                for tag in ("sz", "szCs"):
+                    size = first_run.xpath(f"string(w:rPr/w:{tag}/@w:val)", namespaces=ns)
+                    if size != expected_font_size:
+                        raise RuntimeError(
+                            f"拼音桌签验收失败：第 {slot_index + 1} 个框字号应为"
+                            f"{int(expected_font_size) / 2:g}，XML实际值为 {size or '空'}"
+                        )
+                if not first_run.xpath("w:rPr/w:b", namespaces=ns):
+                    raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框未保留模板加粗")
+    actual_breaks = root.xpath('count(./w:body/w:p/w:r/w:br[@w:type="page"])', namespaces=ns)
+    if int(actual_breaks) != page_count - 1:
+        raise RuntimeError("拼音桌签验收失败：分页数量不符合每页两人的规则")
+    page_width = root.xpath("string(./w:body/w:sectPr/w:pgSz/@w:w)", namespaces=ns)
+    page_height = root.xpath("string(./w:body/w:sectPr/w:pgSz/@w:h)", namespaces=ns)
+    if page_width != "11906" or page_height != "16838":
+        raise RuntimeError("拼音桌签验收失败：纸张尺寸不是模板的 A4 纵向")
+
+
 def verify_output(mode: str, output: Path, names: list[str]) -> None:
     if mode == "dining":
         verify_dining_output(output, names)
     elif mode == "meeting":
         verify_meeting_output(output, names)
+    elif mode == "pinyin":
+        verify_pinyin_output(output, names)
     else:
         raise ValueError(f"不支持的桌签类型：{mode}")
 
@@ -726,6 +1119,8 @@ def build_raw(
         replace_docx(template, names, output, explicit_soffice)
     elif mode == "meeting":
         replace_xlsx(template, names, output, explicit_soffice)
+    elif mode == "pinyin":
+        replace_pinyin_docx(template, names, output, explicit_soffice)
     else:
         raise ValueError(f"不支持的桌签类型：{mode}")
     verify_output(mode, output, names)
@@ -768,6 +1163,11 @@ def template_capacity(mode: str, template: Path, explicit_soffice: str | None) -
             for cell in root.xpath(".//main:sheetData/main:row/main:c", namespaces={"main": MAIN_NS})
             if re.fullmatch(r"A\d+", cell.get("r", ""))
         )
+    elif mode == "pinyin":
+        converted = convert_legacy(template, ".docx", explicit_soffice)
+        with zipfile.ZipFile(converted) as archive:
+            root = etree.fromstring(archive.read("word/document.xml"))
+        capacity = len(collect_dining_slots(root)) // PINYIN_SLOTS_PER_PERSON
     else:
         raise ValueError(f"不支持的桌签类型：{mode}")
     if capacity <= 0:
@@ -813,8 +1213,9 @@ def publish_plans(
 
 def replace_batch(
     mode: str,
-    dining_template: Path,
-    meeting_template: Path,
+    dining_template: Path | None,
+    meeting_template: Path | None,
+    pinyin_template: Path | None,
     names: list[str],
     output_dir: Path,
     stem: str,
@@ -824,18 +1225,27 @@ def replace_batch(
     """Plan branches separately, verify all staged files, then publish the group."""
     safe_stem = output_stem(stem)
     plans: list[tuple[str, Path, list[str], Path]] = []
-    if mode in {"dining", "all"}:
+    if mode in {"dining", "all", "all-three"}:
+        if dining_template is None:
+            raise ValueError("当前模式需要 --dining-template")
         capacity = template_capacity("dining", dining_template, explicit_soffice)
         name_batches = split_name_batches(names, capacity, split_overflow)
         base = output_dir / f"{safe_stem}-吃饭桌签.docx"
         for index, batch_names in enumerate(name_batches, start=1):
             plans.append(("dining", dining_template, batch_names, numbered_output(base, index, len(name_batches))))
-    if mode in {"meeting", "all"}:
+    if mode in {"meeting", "all", "all-three"}:
+        if meeting_template is None:
+            raise ValueError("当前模式需要 --meeting-template")
         capacity = template_capacity("meeting", meeting_template, explicit_soffice)
         name_batches = split_name_batches(names, capacity, split_overflow)
         base = output_dir / f"{safe_stem}-会议桌签.xlsx"
         for index, batch_names in enumerate(name_batches, start=1):
             plans.append(("meeting", meeting_template, batch_names, numbered_output(base, index, len(name_batches))))
+    if mode in {"pinyin", "all-three"}:
+        if pinyin_template is None:
+            raise ValueError("当前模式需要 --pinyin-template")
+        base = output_dir / f"{safe_stem}-拼音桌签.docx"
+        plans.append(("pinyin", pinyin_template, names, base))
     return publish_plans(plans, output_dir, explicit_soffice)
 
 
@@ -846,18 +1256,23 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--source", required=True)
     extract.add_argument("--output", required=True)
     extract.add_argument("--soffice")
+    prepare = sub.add_parser("prepare-pinyin-template", help="只保留原 Word 第一页并建立拼音桌签模板")
+    prepare.add_argument("--source", required=True)
+    prepare.add_argument("--output", required=True)
+    prepare.add_argument("--soffice")
     replace = sub.add_parser("replace", help="替换一个桌签模板中的姓名")
-    replace.add_argument("--mode", choices=["dining", "meeting"], required=True)
+    replace.add_argument("--mode", choices=["dining", "meeting", "pinyin"], required=True)
     replace.add_argument("--template", required=True)
     replace.add_argument("--names-file")
     replace.add_argument("--names")
     replace.add_argument("--output", required=True)
     replace.add_argument("--split-overflow", action="store_true")
     replace.add_argument("--soffice")
-    batch = sub.add_parser("batch", help="分别制作吃饭/会议桌签，并统一返回输出文件")
-    batch.add_argument("--mode", choices=["dining", "meeting", "all"], required=True)
-    batch.add_argument("--dining-template", required=True)
-    batch.add_argument("--meeting-template", required=True)
+    batch = sub.add_parser("batch", help="分别制作吃饭/会议/拼音桌签，并统一返回输出文件")
+    batch.add_argument("--mode", choices=["dining", "meeting", "pinyin", "all", "all-three"], required=True)
+    batch.add_argument("--dining-template")
+    batch.add_argument("--meeting-template")
+    batch.add_argument("--pinyin-template")
     batch.add_argument("--names-file")
     batch.add_argument("--names")
     batch.add_argument("--output-dir", required=True)
@@ -874,6 +1289,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.command == "prepare-pinyin-template":
+        output = Path(args.output)
+        trim_pinyin_template(Path(args.source), output, args.soffice)
+        verify_pinyin_output(output, ["Pinyin", "Sample"])
+        print(f"已只保留第一页并建立拼音桌签模板：{output}")
+        return 0
     if args.command == "extract":
         names = extract_names(Path(args.source), args.soffice)
         Path(args.output).write_text("\n".join(names) + "\n", encoding="utf-8")
@@ -894,8 +1315,9 @@ def main() -> int:
     if args.command == "batch":
         outputs = replace_batch(
             args.mode,
-            Path(args.dining_template),
-            Path(args.meeting_template),
+            Path(args.dining_template) if args.dining_template else None,
+            Path(args.meeting_template) if args.meeting_template else None,
+            Path(args.pinyin_template) if args.pinyin_template else None,
             names,
             Path(args.output_dir),
             args.output_stem,
@@ -908,8 +1330,11 @@ def main() -> int:
         return 0
     template = Path(args.template)
     output = Path(args.output)
-    capacity = template_capacity(args.mode, template, args.soffice)
-    name_batches = split_name_batches(names, capacity, args.split_overflow)
+    if args.mode == "pinyin":
+        name_batches = [names]
+    else:
+        capacity = template_capacity(args.mode, template, args.soffice)
+        name_batches = split_name_batches(names, capacity, args.split_overflow)
     plans = [
         (args.mode, template, batch_names, numbered_output(output, index, len(name_batches)))
         for index, batch_names in enumerate(name_batches, start=1)

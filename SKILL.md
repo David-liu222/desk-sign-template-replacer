@@ -1,13 +1,13 @@
 ---
 name: desk-sign-template-replacer
-description: Replace names in the supplied dining or meeting desk-sign templates while preserving the original borders, text boxes, row heights, print settings, and cut-ready dimensions. Use when the user asks for 餐桌签、吃饭桌签、会议桌签、开会桌签, provides names or a Word name list, or asks to reuse these desk-sign templates.
+description: Replace names in the supplied dining, meeting, or pinyin desk-sign templates while preserving the original borders, text boxes, row heights, print settings, and cut-ready dimensions. Use when the user asks for 餐桌签、吃饭桌签、会议桌签、开会桌签、拼音桌签, provides names or a Word/Excel name list, or asks to reuse these desk-sign templates.
 ---
 
 # 桌签模板替换器
 
 ## Overview
 
-Use the two bundled templates as the format authority. Extract names from direct text or a supplied `.doc`/`.docx`, route the request to an independent dining branch, meeting branch, or both branches, replace only the existing name content, and return editable print-ready file(s). Do not redesign the template, add roles, reorder names, or distribute raw name lists into the skill package.
+Use the three bundled templates as the format authority. Extract names from direct text or a supplied Word/Excel file, route the request to independent dining, meeting, or pinyin branches, replace only the existing name content, and return editable print-ready file(s). Do not redesign the template, add roles, reorder names, or distribute raw name lists into the skill package.
 
 ## Request routing
 
@@ -15,7 +15,9 @@ Route before editing; never let one template branch format the other type:
 
 - `吃饭、就餐、用餐、餐桌签` => run only the `dining` branch.
 - `开会、会议、会议桌签` => run only the `meeting` branch.
+- `拼音、姓名拼音、拼音桌签、英文姓名桌签` => run only the `pinyin` branch. Output pinyin only, not Chinese/pinyin double lines.
 - `全部、两种、吃饭和会议、会议和吃饭、各做一份` => run both branches separately with the same extracted names, then return the two output files as one grouped result. The dining file is produced first and the meeting file second.
+- `全部三种、三个桌签、吃饭会议和拼音` => run `all-three`: dining first, meeting second, pinyin third; return three separate editable files.
 - If the request contains both types but does not clearly ask for both, ask one short question. If it contains neither type, use an explicitly supplied template as the fallback; otherwise ask.
 
 When the request asks for both, use the batch dispatcher so each branch performs its own capacity and layout checks:
@@ -24,8 +26,8 @@ When the request asks for both, use the batch dispatcher so each branch performs
 PYTHON_BIN="/Users/davidliu/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 "$PYTHON_BIN" scripts/desk_signs.py batch \
   --mode all \
-  --dining-template assets/templates/餐桌签.doc \
-  --meeting-template assets/templates/会议桌签.xls \
+  --dining-template assets/templates/餐桌签.docx \
+  --meeting-template assets/templates/会议桌签.xlsx \
   --names-file "/tmp/desk-sign-names.txt" \
   --output-dir "/absolute/path/output" \
   --output-stem "桌签-本次名单"
@@ -33,13 +35,26 @@ PYTHON_BIN="/Users/davidliu/.cache/codex-runtimes/codex-primary-runtime/dependen
 
 The batch command extracts/uses the names once, invokes the two independent replacement functions, and prints both paths. Do not merge the two formats into one document.
 
+For all three branches, use `--mode all-three` and add the one-page pinyin template:
+
+```bash
+"$PYTHON_BIN" scripts/desk_signs.py batch \
+  --mode all-three \
+  --dining-template assets/templates/餐桌签.docx \
+  --meeting-template assets/templates/会议桌签.xlsx \
+  --pinyin-template assets/templates/拼音桌签.docx \
+  --names-file "/tmp/desk-sign-names.txt" \
+  --output-dir "/absolute/path/output" \
+  --output-stem "桌签-本次名单"
+```
+
 For a list that exceeds either template's capacity, add `--split-overflow`. Keep the original name order and create numbered files such as `第01批` and `第02批`; never add rows or shrink the template:
 
 ```bash
 "$PYTHON_BIN" scripts/desk_signs.py batch \
   --mode all \
-  --dining-template assets/templates/餐桌签.doc \
-  --meeting-template assets/templates/会议桌签.xls \
+  --dining-template assets/templates/餐桌签.docx \
+  --meeting-template assets/templates/会议桌签.xlsx \
   --names-file "/tmp/desk-sign-names.txt" \
   --output-dir "/absolute/path/output" \
   --output-stem "桌签-本次名单" \
@@ -48,8 +63,9 @@ For a list that exceeds either template's capacity, add `--split-overflow`. Keep
 
 ## Template selection
 
-- Treat `吃饭、就餐、用餐、餐桌签` as `dining`; use `assets/templates/餐桌签.doc` and output `.docx` after a loss-minimizing legacy conversion.
-- Treat `开会、会议、会议桌签` as `meeting`; use `assets/templates/会议桌签.xls` and output `.xlsx` after a loss-minimizing legacy conversion.
+- Treat `吃饭、就餐、用餐、餐桌签` as `dining`; use `assets/templates/餐桌签.docx`. If the user explicitly supplies a legacy `.doc`, convert it loss-minimally in a temporary directory first.
+- Treat `开会、会议、会议桌签` as `meeting`; use `assets/templates/会议桌签.xlsx`. If the user explicitly supplies a legacy `.xls`, convert it loss-minimally in a temporary directory first.
+- Treat `拼音、姓名拼音、拼音桌签、英文姓名桌签` as `pinyin`; use `assets/templates/拼音桌签.docx`, which contains only page 1 of the user-confirmed source, and output `.docx`.
 - If the user provides an explicit template, use that template and infer the mode from its extension/name unless the user explicitly says otherwise.
 - If neither mode nor template is clear, ask one short question before editing. Do not guess because the two templates have different physical layouts.
 
@@ -62,6 +78,8 @@ For a list that exceeds either template's capacity, add `--split-overflow`. Keep
 - Preserve input order and repeated names. Strip numbering and labels such as `姓名：`; do not silently deduplicate.
 - Never silently correct a valid-looking name. The skill can prove that output matches the source exactly, but it cannot know whether the source itself wrote `陈立` when the intended person was `陈莉`; expose the extracted list for human review when the source may be wrong.
 - Do not treat the old names in the bundled templates as input names. The templates are only format resources.
+- In pinyin mode, Chinese names are converted automatically to toneless surname-first pinyin: `张三` => `Zhang San`, `李佳琦` => `Li Jiaqi`, `欧阳娜娜` => `Ouyang Nana`. The surname and given name are separated by a non-breaking print space so the name cannot wrap inside a frame.
+- Automatic pronunciation cannot reliably resolve every polyphonic character. The script contains common surname overrides, but when the requested pronunciation differs, supply the desired Latin spelling directly in the name list (for example `Yue Le`). Never silently guess after the user supplies an explicit Latin spelling.
 
 ## Large-list safeguards
 
@@ -77,9 +95,9 @@ Apply these safeguards whenever the source is a table, the list contains more th
 
 2. Check the reported count against the source and inspect every row whose `检查结果` is not `通过`. Review `重复次数` rather than deleting repeated names: a repeat may be intentional.
 3. Stop before generation for a one-character item, digits, unsupported punctuation, overlong text, a likely header/summary field, or a likely department/unit value. Do not guess the intended spelling.
-4. If the list exceeds capacity, use `--split-overflow`. Dining and meeting branches split independently because their capacities differ.
+4. If the list exceeds capacity, use `--split-overflow`. Dining and meeting branches split independently because their capacities differ. Pinyin mode repeats its one-page master automatically and remains one DOCX.
 5. Generation is transactional: build all requested branches/batches in a staging directory, verify all of them, and only then publish final files. If any name, font, alignment, or slot check fails, return the error and publish none of the newly generated group.
-6. The built-in post-write verification must compare every output slot with the formatted input in exact order. Dining verifies both compatibility copies of every visible text box, two boxes per person, `楷体、65号`, and horizontal/vertical centering. Meeting verifies each name cell, `方正楷体_GBK、120号`, horizontal/vertical centering, A4 portrait, and a manual page break after every two used rows.
+6. The built-in post-write verification must compare every output slot with the formatted input in exact order. Dining verifies both compatibility copies of every visible text box, two boxes per person, `楷体、65号`, and horizontal/vertical centering. Meeting verifies each name cell, `方正楷体_GBK、120号`, horizontal/vertical centering, A4 portrait, and a manual page break after every two used rows. Pinyin verifies two identical adjacent frames per person, two people per A4 page, surname-first conversion, one consistent fitted font size for the whole file, and the page-1 `楷体、加粗` style.
 
 ## Workflow
 
@@ -96,15 +114,21 @@ Apply these safeguards whenever the source is a table, the list contains more th
    ```bash
    "$PYTHON_BIN" scripts/desk_signs.py replace \
      --mode dining \
-     --template assets/templates/餐桌签.doc \
+     --template assets/templates/餐桌签.docx \
      --names-file "/tmp/desk-sign-names.txt" \
      --output "/absolute/path/餐桌签-替换版.docx"
 
    "$PYTHON_BIN" scripts/desk_signs.py replace \
      --mode meeting \
-     --template assets/templates/会议桌签.xls \
+     --template assets/templates/会议桌签.xlsx \
      --names-file "/tmp/desk-sign-names.txt" \
      --output "/absolute/path/会议桌签-替换版.xlsx"
+
+   "$PYTHON_BIN" scripts/desk_signs.py replace \
+     --mode pinyin \
+     --template assets/templates/拼音桌签.docx \
+     --names-file "/tmp/desk-sign-names.txt" \
+     --output "/absolute/path/拼音桌签-替换版.docx"
    ```
 
    For `全部` requests, use the `batch` command above rather than manually placing dining names into the meeting template or vice versa.
@@ -117,9 +141,10 @@ Apply these safeguards whenever the source is a table, the list contains more th
 
 - Dining template: treat two adjacent visible rectangles as one person's pair and write the same formatted name into both. Keep its borders, dimensions, page geometry, and explicitly use `楷体、65号` inside each box while centering the name horizontally and vertically. A two-character name must use one full-width space so its first and second characters align with the first and third positions of a three-character name, such as `张　三`; a three-character name is written without an internal space, such as `李佳琦`. The template has 92 people slots; blank unused boxes on the last used page and remove trailing unused template pages so a short list is directly printable.
 - Meeting template: patch only the existing name cells in `Sheet1!A1:A34`; keep all other sheets, cell styles, used row heights, borders, margins, orientation, and scaling. Preserve the user-confirmed template font `方正楷体_GBK、120号` on the name cells even when legacy conversion reports a different font. Remove trailing unused name rows from the printable range and insert a manual page break after every two used rows, so each A4 portrait sheet contains exactly two bordered name frames and a partial final batch does not print blank pages. Apply the same name alignment rule as dining signs: use one full-width space for a two-character name, such as `张　三`, so its two glyphs occupy the first and third positions; leave three-character names such as `李佳琦` unchanged. The template has 34 slots and one person per cell.
+- Pinyin template: the bundled DOCX is a sanitized copy of only page 1 from the supplied legacy Word file. Preserve its A4 portrait page, four bordered rectangles, exact anchor positions, `楷体、65号、加粗` maximum typography, and paragraph geometry. Each person occupies two adjacent identical frames; each page contains two people. For more than two names, clone only this first-page layout and insert a page break between copies. Keep all pinyin on one line. Use one font size for the whole output: start at the template's 65 points and reduce the batch uniformly only when the longest pinyin would otherwise be clipped; reject a spelling that would still exceed the frame below 30 points. On an odd final page, keep the unused pair blank without removing its cut border.
 - If the list exceeds the selected template capacity, stop with a clear error unless `--split-overflow` is active. With that option, split by the detected template capacity into numbered files without reordering names; do not add rows or shrink text.
 - Keep Chinese internal spacing exactly as supplied when it is meaningful (for example, `李  波`). Do not add `班长：` or other role labels unless the user explicitly includes them.
 
 ## Script contract
 
-`scripts/desk_signs.py` uses ZIP/XML-level edits for DOCX/XLSX values so it does not recreate tables or restyle the workbook. It accepts the bundled legacy templates, converts them only in a temporary directory, audits risky name values, preserves real spreadsheet column positions, splits overflow lists, and verifies every generated slot before atomic publication. It requires the bundled Python runtime, `lxml`, and a usable `soffice` for legacy conversion.
+`scripts/desk_signs.py` uses ZIP/XML-level edits for DOCX/XLSX values so it does not recreate tables or restyle the workbook. It accepts the bundled legacy templates, converts them only in a temporary directory, audits risky name values, preserves real spreadsheet column positions, splits overflow lists, repeats the pinyin page-1 master, and verifies every generated slot before atomic publication. Chinese-to-pinyin conversion uses the bundled Swift helper and macOS Foundation, so no network lookup or third-party pinyin package is needed. It requires the bundled Python runtime, `lxml`, macOS `/usr/bin/swift`, and a usable `soffice` for legacy conversion.
