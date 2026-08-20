@@ -30,8 +30,10 @@ DINING_FONT_HALF_POINTS = "130"
 MEETING_FONT = "方正楷体_GBK"
 MEETING_FONT_POINTS = "120"
 PINYIN_FONT = "楷体"
-PINYIN_FONT_HALF_POINTS = "130"
-PINYIN_PEOPLE_PER_PAGE = 2
+PINYIN_LATIN_HALF_POINTS = "130"
+PINYIN_CHINESE_HALF_POINTS = "112"
+PINYIN_ROMAN_HALF_POINTS = "72"
+PINYIN_PEOPLE_PER_PAGE = 4
 PINYIN_SLOTS_PER_PERSON = 2
 PINYIN_INNER_WIDTH_POINTS = 230.0
 COMPOUND_SURNAMES = {
@@ -579,6 +581,82 @@ def set_textbox_text_preserving_style(box: etree._Element, value: str) -> None:
         node.attrib.pop(f"{{{XML_NS}}}space", None)
 
 
+def replace_textbox_content(shape: etree._Element, prototype_box: etree._Element) -> etree._Element:
+    boxes = shape.xpath(".//w:txbxContent", namespaces={"w": W_NS})
+    if not boxes:
+        raise RuntimeError("拼音桌签框缺少文本框内容")
+    old_box = boxes[0]
+    new_box = deepcopy(prototype_box)
+    parent = old_box.getparent()
+    if parent is None:
+        raise RuntimeError("拼音桌签文本框结构无效")
+    parent.replace(old_box, new_box)
+    return new_box
+
+
+def set_run_half_points(run: etree._Element, half_points: str) -> None:
+    rpr = run.find(f"{W}rPr")
+    if rpr is None:
+        rpr = etree.Element(f"{W}rPr")
+        run.insert(0, rpr)
+    for tag in ("sz", "szCs"):
+        size = rpr.find(f"{W}{tag}")
+        if size is None:
+            size = etree.SubElement(rpr, f"{W}{tag}")
+        size.set(f"{W}val", half_points)
+
+
+def format_bilingual_chinese_name(value: str) -> str:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) == 2:
+        # The supplied pinyin template uses two ordinary spaces, not an
+        # ideographic space, between two Chinese characters.
+        return f"{compact[0]}  {compact[1]}"
+    return compact
+
+
+def set_bilingual_box_text(
+    box: etree._Element,
+    chinese_name: str,
+    pinyin_name: str,
+    pinyin_half_points: str,
+) -> None:
+    paragraphs = box.xpath("./w:p", namespaces={"w": W_NS})
+    if len(paragraphs) < 2:
+        raise RuntimeError("拼音桌签双语框必须包含中文行和拼音行")
+    values = [format_bilingual_chinese_name(chinese_name), pinyin_name]
+    sizes = [PINYIN_CHINESE_HALF_POINTS, pinyin_half_points]
+    for paragraph, value, size in zip(paragraphs[:2], values, sizes, strict=True):
+        text_nodes = paragraph.xpath(".//w:t", namespaces={"w": W_NS})
+        if not text_nodes:
+            run = paragraph.find(f"{W}r")
+            if run is None:
+                run = etree.SubElement(paragraph, f"{W}r")
+            text_nodes = [etree.SubElement(run, f"{W}t")]
+        text_nodes[0].text = value
+        if "  " in value:
+            text_nodes[0].set(f"{{{XML_NS}}}space", "preserve")
+        else:
+            text_nodes[0].attrib.pop(f"{{{XML_NS}}}space", None)
+        for node in text_nodes[1:]:
+            node.text = ""
+            node.attrib.pop(f"{{{XML_NS}}}space", None)
+        runs = paragraph.xpath("./w:r", namespaces={"w": W_NS})
+        if runs:
+            set_run_half_points(runs[0], size)
+    for paragraph in paragraphs[2:]:
+        for node in paragraph.xpath(".//w:t", namespaces={"w": W_NS}):
+            node.text = ""
+
+
+def set_single_line_box_text(box: etree._Element, value: str, half_points: str) -> None:
+    set_textbox_text_preserving_style(box, value)
+    runs = box.xpath(".//w:r[w:t]", namespaces={"w": W_NS})
+    if not runs:
+        raise RuntimeError("拼音桌签外籍姓名框缺少文字运行")
+    set_run_half_points(runs[0], half_points)
+
+
 def renumber_cloned_shapes(root: etree._Element) -> None:
     """Give cloned modern/VML shapes unique IDs so Word can open repeated pages safely."""
     ns = {
@@ -598,16 +676,25 @@ def trim_pinyin_template(
     output: Path,
     explicit_soffice: str | None,
 ) -> None:
-    """Keep only source page 1 and sanitize its four name boxes."""
+    """Keep WPS page 1 (eight frames/four people) and sanitize its names."""
     converted = convert_legacy(source, ".docx", explicit_soffice)
     with zipfile.ZipFile(converted) as archive:
         members = {info.filename: archive.read(info.filename) for info in archive.infolist()}
     root = etree.fromstring(members["word/document.xml"])
     ns = {"w": W_NS}
     slots = collect_dining_slots(root)
-    if len(slots) < PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON:
-        raise RuntimeError("拼音桌签第一页少于4个姓名框，无法建立模板")
-    first_page_slots = slots[: PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON]
+    expected_slots = PINYIN_PEOPLE_PER_PAGE * PINYIN_SLOTS_PER_PERSON
+    if len(slots) < expected_slots:
+        raise RuntimeError(f"拼音桌签第一页少于{expected_slots}个姓名框，无法建立模板")
+    first_page_slots = slots[:expected_slots]
+    latin_prototypes = [
+        deepcopy(shape.xpath(".//w:txbxContent", namespaces=ns)[0])
+        for shape in first_page_slots[0][3]
+    ]
+    bilingual_prototypes = [
+        deepcopy(shape.xpath(".//w:txbxContent", namespaces=ns)[0])
+        for shape in first_page_slots[6][3]
+    ]
     last_paragraph_index = first_page_slots[-1][0]
     body = root.find(f"{W}body")
     if body is None:
@@ -619,12 +706,28 @@ def trim_pinyin_template(
         parent = page_break.getparent()
         if parent is not None:
             parent.remove(page_break)
-    placeholders = ["Pinyin", "Pinyin", "Sample", "Sample"]
     retained_slots = collect_dining_slots(root)
-    for slot, placeholder in zip(retained_slots, placeholders, strict=True):
-        for shape in slot[3]:
-            for box in shape.xpath(".//w:txbxContent", namespaces=ns):
-                set_textbox_text_preserving_style(box, placeholder)
+    placeholder_people = ["Foreign", "Guest", "张三", "李佳琦"]
+    placeholder_pinyin = romanize_names(placeholder_people)
+    for slot_index, slot in enumerate(retained_slots):
+        person_index = slot_index // PINYIN_SLOTS_PER_PERSON
+        name = placeholder_people[person_index]
+        for shape_index, shape in enumerate(slot[3]):
+            if re.search(r"[\u3400-\u9fff]", name):
+                box = replace_textbox_content(shape, bilingual_prototypes[shape_index])
+                set_bilingual_box_text(
+                    box,
+                    name,
+                    placeholder_pinyin[person_index],
+                    pinyin_line_half_points(placeholder_pinyin[person_index]),
+                )
+            else:
+                box = replace_textbox_content(shape, latin_prototypes[shape_index])
+                set_single_line_box_text(
+                    box,
+                    placeholder_pinyin[person_index],
+                    latin_line_half_points(placeholder_pinyin[person_index]),
+                )
     renumber_cloned_shapes(root)
     members["word/document.xml"] = etree.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -636,9 +739,7 @@ def normalize_latin_name(value: str) -> str:
     words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", value)
     if not words:
         raise ValueError(f"无法识别拼音姓名：{value}")
-    # A non-breaking space keeps a full pinyin name on one line inside the
-    # original 65-point first-page frame. It prints like an ordinary space.
-    return "\u00a0".join(word[:1].upper() + word[1:].lower() for word in words)
+    return " ".join(word[:1].upper() + word[1:].lower() for word in words)
 
 
 def romanize_names(names: list[str]) -> list[str]:
@@ -683,7 +784,8 @@ def romanize_names(names: list[str]) -> list[str]:
         else:
             surname = "".join(token.lower() for token in tokens[:surname_length]).capitalize()
         given_name = "".join(token.lower() for token in tokens[surname_length:]).capitalize()
-        output.append(f"{surname}\u00a0{given_name}")
+        separator = "  " if len(compact) == 2 and surname_length == 1 else " "
+        output.append(f"{surname}{separator}{given_name}")
     return output
 
 
@@ -706,27 +808,19 @@ def pinyin_em_width(value: str) -> float:
     return max(total, 1.0)
 
 
-def pinyin_font_half_points(values: list[str]) -> str:
-    """Use one size for the whole output, capped at the page-1 template's 65 pt."""
-    widest = max(pinyin_em_width(value) for value in values)
-    fitted_points = int((PINYIN_INNER_WIDTH_POINTS * 0.94) // widest)
+def fitted_half_points(value: str, maximum_points: int) -> str:
+    fitted_points = int((PINYIN_INNER_WIDTH_POINTS * 0.94) // pinyin_em_width(value))
     if fitted_points < 30:
-        longest = max(values, key=pinyin_em_width)
-        raise ValueError(f"拼音姓名“{longest.replace(chr(160), ' ')}”过长，30磅仍可能超出框，请缩短或确认写法")
-    return str(min(65, fitted_points) * 2)
+        raise ValueError(f"姓名“{value}”过长，30磅仍可能超出原模板框")
+    return str(min(maximum_points, fitted_points) * 2)
 
 
-def set_pinyin_font_size(box: etree._Element, half_points: str) -> None:
-    for run in box.xpath(".//w:r", namespaces={"w": W_NS}):
-        rpr = run.find(f"{W}rPr")
-        if rpr is None:
-            rpr = etree.Element(f"{W}rPr")
-            run.insert(0, rpr)
-        for tag in ("sz", "szCs"):
-            size = rpr.find(f"{W}{tag}")
-            if size is None:
-                size = etree.SubElement(rpr, f"{W}{tag}")
-            size.set(f"{W}val", half_points)
+def latin_line_half_points(value: str) -> str:
+    return fitted_half_points(value, int(PINYIN_LATIN_HALF_POINTS) // 2)
+
+
+def pinyin_line_half_points(value: str) -> str:
+    return fitted_half_points(value, int(PINYIN_ROMAN_HALF_POINTS) // 2)
 
 
 def page_break_paragraph() -> etree._Element:
@@ -756,6 +850,15 @@ def replace_pinyin_docx(
         raise RuntimeError(
             f"拼音桌签模板必须只保留第一页的 {expected_template_slots} 个框，实际为 {len(template_slots)} 个"
         )
+    ns = {"w": W_NS}
+    latin_prototypes = [
+        deepcopy(shape.xpath(".//w:txbxContent", namespaces=ns)[0])
+        for shape in template_slots[0][3]
+    ]
+    bilingual_prototypes = [
+        deepcopy(shape.xpath(".//w:txbxContent", namespaces=ns)[0])
+        for shape in template_slots[4][3]
+    ]
     section = body.find(f"{W}sectPr")
     template_children = [deepcopy(child) for child in body if child is not section]
     if not template_children:
@@ -772,21 +875,32 @@ def replace_pinyin_docx(
         body.append(section)
     renumber_cloned_shapes(root)
     pinyin_names = romanize_names(names)
-    font_half_points = pinyin_font_half_points(pinyin_names)
     slots = collect_dining_slots(root)
     expected_slot_count = page_count * expected_template_slots
     if len(slots) != expected_slot_count:
         raise RuntimeError(
             f"拼音桌签扩页失败：应有 {expected_slot_count} 个框，实际为 {len(slots)} 个"
         )
-    ns = {"w": W_NS}
     for slot_index, slot in enumerate(slots):
         person_index = slot_index // PINYIN_SLOTS_PER_PERSON
-        value = pinyin_names[person_index] if person_index < len(pinyin_names) else "\u00a0"
-        for shape in slot[3]:
-            for box in shape.xpath(".//w:txbxContent", namespaces=ns):
-                set_textbox_text_preserving_style(box, value)
-                set_pinyin_font_size(box, font_half_points)
+        for shape_index, shape in enumerate(slot[3]):
+            if person_index >= len(names):
+                box = replace_textbox_content(shape, bilingual_prototypes[shape_index])
+                set_bilingual_box_text(box, "\u00a0", "\u00a0", PINYIN_ROMAN_HALF_POINTS)
+                continue
+            name = names[person_index]
+            pinyin_name = pinyin_names[person_index]
+            if re.search(r"[\u3400-\u9fff]", name):
+                box = replace_textbox_content(shape, bilingual_prototypes[shape_index])
+                set_bilingual_box_text(
+                    box,
+                    name,
+                    pinyin_name,
+                    pinyin_line_half_points(pinyin_name),
+                )
+            else:
+                box = replace_textbox_content(shape, latin_prototypes[shape_index])
+                set_single_line_box_text(box, pinyin_name, latin_line_half_points(pinyin_name))
     members["word/document.xml"] = etree.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
     )
@@ -1045,7 +1159,7 @@ def verify_meeting_output(output: Path, names: list[str]) -> None:
 
 
 def verify_pinyin_output(output: Path, names: list[str]) -> None:
-    """Verify repeated pairs, first-page typography, and two people per A4 page."""
+    """Verify WPS page-1 layout: four people, paired frames, Chinese plus pinyin."""
     with zipfile.ZipFile(output) as archive:
         root = etree.fromstring(archive.read("word/document.xml"))
     ns = {"w": W_NS}
@@ -1055,42 +1169,74 @@ def verify_pinyin_output(output: Path, names: list[str]) -> None:
     if len(slots) != expected_slots:
         raise RuntimeError(f"拼音桌签验收失败：应有 {expected_slots} 个框，实际为 {len(slots)} 个")
     pinyin_names = romanize_names(names)
-    expected_font_size = pinyin_font_half_points(pinyin_names)
-    expected = [value for value in pinyin_names for _ in range(PINYIN_SLOTS_PER_PERSON)]
-    expected.extend(["\u00a0"] * (expected_slots - len(expected)))
     for slot_index, (_, _, _, shapes) in enumerate(slots):
+        person_index = slot_index // PINYIN_SLOTS_PER_PERSON
+        if person_index < len(names):
+            source_name = names[person_index]
+            expected_pinyin = pinyin_names[person_index]
+            chinese_mode = bool(re.search(r"[\u3400-\u9fff]", source_name))
+            expected_texts = (
+                [format_bilingual_chinese_name(source_name), expected_pinyin]
+                if chinese_mode
+                else [expected_pinyin]
+            )
+        else:
+            source_name = ""
+            expected_pinyin = ""
+            chinese_mode = True
+            expected_texts = []
         for shape in shapes:
             boxes = shape.xpath(".//w:txbxContent", namespaces=ns)
             if not boxes:
                 raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框没有文本内容")
             for box in boxes:
-                actual = "".join(box.xpath(".//w:t/text()", namespaces=ns))
-                if actual != expected[slot_index]:
+                paragraphs = box.xpath("./w:p", namespaces=ns)
+                actual_texts = ["".join(p.xpath(".//w:t/text()", namespaces=ns)) for p in paragraphs]
+                actual_texts = [value for value in actual_texts if value]
+                if not source_name:
+                    if any(value.strip(" \u00a0") for value in actual_texts):
+                        raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个未用框含有旧姓名")
+                    continue
+                if actual_texts != expected_texts:
                     raise RuntimeError(
-                        f"拼音桌签验收失败：第 {slot_index + 1} 个框应为“{expected[slot_index]}”，实际为“{actual}”"
+                        f"拼音桌签验收失败：第 {slot_index + 1} 个框应为{expected_texts}，实际为{actual_texts}"
                     )
-                runs = box.xpath(".//w:r[w:t]", namespaces=ns)
-                if not runs:
-                    raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框缺少文字运行")
-                first_run = runs[0]
-                for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
-                    font = first_run.xpath(f"string(w:rPr/w:rFonts/@w:{attribute})", namespaces=ns)
-                    if font != PINYIN_FONT:
+                runs: list[etree._Element] = []
+                for paragraph in paragraphs[: len(expected_texts)]:
+                    line_runs = paragraph.xpath("./w:r[w:t]", namespaces=ns)
+                    if not line_runs:
+                        raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框缺少文字运行")
+                    runs.append(line_runs[0])
+                expected_sizes = (
+                    [
+                        PINYIN_CHINESE_HALF_POINTS,
+                        PINYIN_ROMAN_HALF_POINTS if not source_name else pinyin_line_half_points(expected_pinyin),
+                    ]
+                    if chinese_mode
+                    else [latin_line_half_points(expected_pinyin)]
+                )
+                for line_index, (run, expected_size) in enumerate(zip(runs, expected_sizes, strict=True), start=1):
+                    for attribute in ("ascii", "hAnsi", "eastAsia", "cs"):
+                        font = run.xpath(f"string(w:rPr/w:rFonts/@w:{attribute})", namespaces=ns)
+                        if font != PINYIN_FONT:
+                            raise RuntimeError(
+                                f"拼音桌签验收失败：第 {slot_index + 1} 框第 {line_index} 行字体"
+                                f"应为 {PINYIN_FONT}，实际为 {font or '空'}"
+                            )
+                    size = run.xpath("string(w:rPr/w:sz/@w:val)", namespaces=ns)
+                    if size != expected_size:
                         raise RuntimeError(
-                            f"拼音桌签验收失败：第 {slot_index + 1} 个框字体应为 {PINYIN_FONT}，实际为 {font or '空'}"
+                            f"拼音桌签验收失败：第 {slot_index + 1} 框第 {line_index} 行字号"
+                            f"应为 {int(expected_size) / 2:g}，实际为 {size or '空'}"
                         )
-                for tag in ("sz", "szCs"):
-                    size = first_run.xpath(f"string(w:rPr/w:{tag}/@w:val)", namespaces=ns)
-                    if size != expected_font_size:
-                        raise RuntimeError(
-                            f"拼音桌签验收失败：第 {slot_index + 1} 个框字号应为"
-                            f"{int(expected_font_size) / 2:g}，XML实际值为 {size or '空'}"
-                        )
-                if not first_run.xpath("w:rPr/w:b", namespaces=ns):
-                    raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个框未保留模板加粗")
+                if chinese_mode:
+                    if any(run.xpath("w:rPr/w:b", namespaces=ns) for run in runs):
+                        raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个双语框不应加粗")
+                elif not runs[0].xpath("w:rPr/w:b", namespaces=ns):
+                    raise RuntimeError(f"拼音桌签验收失败：第 {slot_index + 1} 个外籍姓名框未保留加粗")
     actual_breaks = root.xpath('count(./w:body/w:p/w:r/w:br[@w:type="page"])', namespaces=ns)
     if int(actual_breaks) != page_count - 1:
-        raise RuntimeError("拼音桌签验收失败：分页数量不符合每页两人的规则")
+        raise RuntimeError("拼音桌签验收失败：分页数量不符合每页四人的规则")
     page_width = root.xpath("string(./w:body/w:sectPr/w:pgSz/@w:w)", namespaces=ns)
     page_height = root.xpath("string(./w:body/w:sectPr/w:pgSz/@w:h)", namespaces=ns)
     if page_width != "11906" or page_height != "16838":
@@ -1292,7 +1438,7 @@ def main() -> int:
     if args.command == "prepare-pinyin-template":
         output = Path(args.output)
         trim_pinyin_template(Path(args.source), output, args.soffice)
-        verify_pinyin_output(output, ["Pinyin", "Sample"])
+        verify_pinyin_output(output, ["Foreign", "Guest", "张三", "李佳琦"])
         print(f"已只保留第一页并建立拼音桌签模板：{output}")
         return 0
     if args.command == "extract":
